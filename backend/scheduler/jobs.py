@@ -51,12 +51,33 @@ DB/MQTT/실예측이 없는 환경에서도 더미 데이터로 1회 실행 검�
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 import importlib
 import json
 from pathlib import Path
 from typing import Any
+
+try:
+    from dotenv import load_dotenv
+except Exception:  # pragma: no cover - optional dependency fallback
+    load_dotenv = None  # type: ignore
+
+if load_dotenv is not None:
+    # 로컬 시크릿(.env.local)을 우선 로드하고, 없으면 기본 .env도 함께 허용한다.
+    load_dotenv(Path(__file__).resolve().parents[2] / ".env.local", override=False)
+    load_dotenv(override=False)
+
+try:
+    from backend.services import tou_service
+except Exception:  # pragma: no cover - optional integration fallback
+    tou_service = None  # type: ignore
+
+try:
+    from backend.services import weather_service
+except Exception:  # pragma: no cover - optional integration fallback
+    weather_service = None  # type: ignore
 
 try:
     _aps_module = importlib.import_module("apscheduler.schedulers.background")
@@ -201,8 +222,8 @@ def _hour_in_slot(hour: int, start: int, end: int) -> bool:
     return hour >= start or hour < end
 
 
-def get_tou_price(now: datetime, pricing_tou: dict[str, Any]) -> float:
-    """현재 시각에 해당하는 TOU 단가(원/kWh)를 계산한다."""
+def _dummy_tou_price(now: datetime, pricing_tou: dict[str, Any]) -> float:
+    """더미 pricing_tou 슬롯 기준 TOU 단가(원/kWh)를 계산한다."""
     hour = now.hour
     for slot in pricing_tou.get("slots", []):
         start = int(slot.get("start_hour", 0))
@@ -210,6 +231,23 @@ def get_tou_price(now: datetime, pricing_tou: dict[str, Any]) -> float:
         if _hour_in_slot(hour, start, end):
             return float(slot.get("price", 0))
     return float(pricing_tou.get("current_price_krw_per_kwh", 0))
+
+
+def get_tou_price_with_source(now: datetime, pricing_tou: dict[str, Any]) -> tuple[float, str]:
+    """현재 시각 TOU 단가와 소스(service/dummy)를 함께 반환한다."""
+    use_service_tou = bool(pricing_tou.get("use_service_tou", True))
+    if use_service_tou and tou_service is not None:
+        try:
+            return float(tou_service.get_tou_price_krw_per_kwh(now)), "SERVICE"
+        except Exception:
+            pass
+    return _dummy_tou_price(now, pricing_tou), "DUMMY"
+
+
+def get_tou_price(now: datetime, pricing_tou: dict[str, Any]) -> float:
+    """현재 시각에 해당하는 TOU 단가(원/kWh)를 계산한다."""
+    price, _ = get_tou_price_with_source(now, pricing_tou)
+    return price
 
 
 def _active_job(data: dict[str, Any]) -> dict[str, Any] | None:
@@ -236,7 +274,7 @@ def _solar_forecast_for_horizon(
     deadline: datetime | None,
 ) -> list[dict[str, Any]]:
     """현재 시각부터 deadline까지 구간에 해당하는 태양광 예측 행들을 필터링한다."""
-    if deadline is None:
+    if deadline is None or deadline <= now:
         deadline = now + timedelta(hours=24)
     rows: list[dict[str, Any]] = []
     for row in data.get("predict_solar", []):
@@ -254,7 +292,7 @@ def _outdoor_temp_forecast_for_horizon(
     deadline: datetime | None,
 ) -> list[dict[str, Any]]:
     """현재 시각부터 deadline까지 구간의 시간대별 외기온 예측 행을 필터링한다."""
-    if deadline is None:
+    if deadline is None or deadline <= now:
         deadline = now + timedelta(hours=24)
     rows: list[dict[str, Any]] = []
     for row in data.get("predict_outdoor_temp_hourly", []):
@@ -264,6 +302,77 @@ def _outdoor_temp_forecast_for_horizon(
         if now <= ts <= deadline:
             rows.append(row)
     return rows
+
+
+def _service_outdoor_temp_forecast_for_horizon(
+    now: datetime,
+    deadline: datetime | None,
+    env_weights: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """KMA 서비스 예보를 optimization 입력 포맷(timestamp/temp_c)으로 변환한다."""
+    if weather_service is None:
+        return []
+
+    if deadline is None or deadline <= now:
+        deadline = now + timedelta(hours=24)
+
+    nx = int(env_weights.get("kma_nx", 60))
+    ny = int(env_weights.get("kma_ny", 127))
+
+    try:
+        today_rows = asyncio.run(weather_service.fetch_today_forecast(nx=nx, ny=ny))
+        tomorrow_rows = asyncio.run(weather_service.fetch_tomorrow_forecast(nx=nx, ny=ny))
+    except Exception:
+        return []
+
+    converted: list[dict[str, Any]] = []
+    for row in [*today_rows, *tomorrow_rows]:
+        if not isinstance(row, dict):
+            continue
+        date_raw = str(row.get("date", ""))
+        hour_raw = str(row.get("hour", "")).zfill(2)
+        temp_raw = row.get("temperature_c")
+        if len(date_raw) != 8 or not date_raw.isdigit():
+            continue
+        if len(hour_raw) < 2 or not hour_raw[:2].isdigit():
+            continue
+        try:
+            ts = datetime(
+                year=int(date_raw[0:4]),
+                month=int(date_raw[4:6]),
+                day=int(date_raw[6:8]),
+                hour=int(hour_raw[:2]),
+                minute=0,
+                second=0,
+                tzinfo=now.tzinfo,
+            )
+            temp_c = float(temp_raw)
+        except (TypeError, ValueError):
+            continue
+        if now <= ts <= deadline:
+            converted.append({"timestamp": ts.isoformat(), "temp_c": temp_c})
+
+    converted.sort(key=lambda x: str(x.get("timestamp", "")))
+    return converted
+
+
+def _resolve_outdoor_temp_forecast(
+    data: dict[str, Any],
+    now: datetime,
+    deadline: datetime | None,
+    env_weights: dict[str, Any],
+) -> tuple[list[dict[str, Any]], str]:
+    """외기온 예보 입력을 서비스 우선으로 구성하고 실패 시 더미로 폴백한다."""
+    use_service_weather = bool(env_weights.get("use_service_weather", True))
+    if use_service_weather:
+        service_rows = _service_outdoor_temp_forecast_for_horizon(
+            now=now,
+            deadline=deadline,
+            env_weights=env_weights,
+        )
+        if service_rows:
+            return service_rows, "SERVICE"
+    return _outdoor_temp_forecast_for_horizon(data, now, deadline), "DUMMY"
 
 
 def _planned_inbound_by_factory(
@@ -419,11 +528,16 @@ def run_job_a_optimization(
 
     factories = _available_factories(data)
     pricing_tou = data.get("pricing_tou", {})
-    tou_price = get_tou_price(resolved_now, pricing_tou)
+    tou_price, tou_price_source = get_tou_price_with_source(resolved_now, pricing_tou)
     deadline = _parse_iso(active_job.get("deadline_at"))
     env_weights = data.get("environment_weights", {})
     solar_forecast = _solar_forecast_for_horizon(data, resolved_now, deadline)
-    outdoor_temp_forecast = _outdoor_temp_forecast_for_horizon(data, resolved_now, deadline)
+    outdoor_temp_forecast, outdoor_temp_source = _resolve_outdoor_temp_forecast(
+        data=data,
+        now=resolved_now,
+        deadline=deadline,
+        env_weights=env_weights,
+    )
 
     available_factory_ids = {int(factory.get("factory_id")) for factory in factories if "factory_id" in factory}
     planned_inbound_by_factory = _planned_inbound_by_factory(
@@ -457,12 +571,24 @@ def run_job_a_optimization(
             str(factory_id): count for factory_id, count in door_open_count_by_factory.items()
         }
 
+    tou_slots_for_optimization = pricing_tou.get("slots", [])
+    if tou_price_source == "SERVICE":
+        # optimization_service가 슬롯에서 TOU를 재계산하므로 서비스 단가를 단일 슬롯으로 전달한다.
+        tou_slots_for_optimization = [
+            {
+                "start_hour": 0,
+                "end_hour": 24,
+                "price": tou_price,
+                "label": "SERVICE_TOU",
+            }
+        ]
+
     ctx = JobAContext(
         now=resolved_now,
         active_job=optimization_job,
         factories=factories,
         tou_price=tou_price,
-        tou_slots=pricing_tou.get("slots", []),
+        tou_slots=tou_slots_for_optimization,
         env_weights=env_weights,
         solar_forecast=solar_forecast,
         outdoor_temp_forecast=outdoor_temp_forecast,
@@ -486,6 +612,8 @@ def run_job_a_optimization(
         "computed_at": resolved_now.isoformat(),
         "job_id": active_job.get("job_id"),
         "tou_price_krw_per_kwh": tou_price,
+        "tou_price_source": tou_price_source,
+        "outdoor_temp_source": outdoor_temp_source,
         "remaining_units": remaining_units,
         "factory_count": len(factories),
         "schedule_blocks": blocks,
