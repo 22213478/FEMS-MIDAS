@@ -1,13 +1,50 @@
 import streamlit as st
 import plotly.graph_objects as go
+from datetime import datetime, timedelta
 
+def temp_chart_data(data):
+    now = datetime.now()
+    times = [now - timedelta(hours=23 - i) for i in range(24)]
+
+    base_temp = data["temp_now"]
+
+    temps = [
+        base_temp - 0.8,
+        base_temp - 0.7,
+        base_temp - 0.6,
+        base_temp - 0.5,
+        base_temp - 0.4,
+        base_temp - 0.3,
+        base_temp - 0.2,
+        base_temp - 0.1,
+        base_temp,
+        base_temp + 0.2,
+        base_temp + 0.4,
+        base_temp + 0.5,
+        base_temp + 0.3,
+        base_temp + 0.1,
+        base_temp,
+        base_temp - 0.2,
+        base_temp - 0.4,
+        base_temp - 0.5,
+        base_temp - 0.3,
+        base_temp - 0.1,
+        base_temp,
+        base_temp + 0.1,
+        base_temp - 0.1,
+        base_temp,
+    ]
+
+    return times, temps
 
 def temp_chart(data):
+    times, temps = temp_chart_data(data)
+
     fig = go.Figure()
 
     fig.add_hrect(
         y0=-16,
-        y1=-13,
+        y1=-10,
         fillcolor="rgba(255,107,107,0.08)",
         line_width=0,
         annotation_text="경보 구간",
@@ -25,24 +62,34 @@ def temp_chart(data):
     )
 
     fig.add_trace(go.Scatter(
-        x=data["times"],
-        y=data["temps"],
+        x=times,
+        y=temps,
         mode="lines",
         line=dict(color="#0077cc", width=2.5, shape="spline"),
-        fill="tozeroy",
+        fill="tonexty",
         fillcolor="rgba(0,119,204,0.08)",
         hovertemplate="%{x|%H:%M}<br><b>%{y}°C</b><extra></extra>",
         showlegend=False,
     ))
 
     fig.add_trace(go.Scatter(
-        x=[data["times"][-1]],
-        y=[data["temps"][-1]],
-        mode="markers",
-        marker=dict(color="#0077cc", size=9, line=dict(color="#ffffff", width=2)),
+        x=times,
+        y=[-50]*len(times),
+        mode="lines",
+        line=dict(width=0),
         showlegend=False,
-        hoverinfo="skip",
     ))
+
+    fig.add_trace(go.Scatter(
+        x=times,
+        y=temps,
+        mode="lines",
+        line=dict(color="#0077cc", width=2.5, shape="spline"),
+        fill="tonexty",
+        fillcolor="rgba(0,119,204,0.15)",  # 조금 더 진하게 추천
+        hovertemplate="%{x|%H:%M}<br><b>%{y}°C</b><extra></extra>",
+        showlegend=False,
+))
 
     fig.update_layout(
         paper_bgcolor="white",
@@ -57,10 +104,10 @@ def temp_chart(data):
             ticks="",
             tickmode="array",
             tickvals=[
-                data["times"][0],
-                data["times"][6],
-                data["times"][12],
-                data["times"][18],
+                times[0],
+                times[6],
+                times[12],
+                times[18],
             ],
             ticktext=["00시", "06시", "12시", "18시"],
             tickfont=dict(size=9, color="#6b8299"),
@@ -72,10 +119,10 @@ def temp_chart(data):
             showline=False,
             ticks="",
             tickmode="array",
-            tickvals=[-20, -15, -10, -5],
-            ticktext=["-20°", "-15°", "-10°", "-5°"],
+            tickvals=[-30, -20, -10, 0],
+            ticktext=["-30°", "-20°", "-10°", "0°"],
             tickfont=dict(size=9, color="#6b8299"),
-            range=[-21, -4],
+            range=[-30, 0],
         ),
     )
 

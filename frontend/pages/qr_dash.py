@@ -50,8 +50,8 @@ def get_factory_data(token: str):
     api_data = result["data"]
 
     now = datetime.now()
-    times = [now - timedelta(hours=23 - i) for i in range(24)]
-    temps = [api_data["temperature_c"] for _ in range(24)]
+    # times = [now - timedelta(hours=23 - i) for i in range(24)]
+    # temps = [api_data["temperature_c"] for _ in range(24)]
 
     return {
         "factory_id": api_data["factory_id"],
@@ -60,8 +60,8 @@ def get_factory_data(token: str):
         "temp_now": api_data["temperature_c"],
         "humidity": api_data["humidity_pct"],
         "updated": api_data["last_updated_at"][11:19],
-        "times": times,
-        "temps": temps,
+        # "times": times,
+        # "temps": temps,
         "power_now": 0,
         "power_max": 80.0,
         "power_24h": 0,
@@ -116,7 +116,7 @@ st.markdown(
   </span>
 </div>
 <div class="dashboard-sub">
-  <span class="live-dot"></span>LIVE · {data['updated']}
+  <span class="live-dot"></span>LIVE · 최근 업데이트 {data['updated']}
 </div>
 """,
     unsafe_allow_html=True,
