@@ -9,7 +9,7 @@ from mqtt.status_store import status_store
 
 router = APIRouter(prefix="/api/v1/control", tags=["control"])
 
-ALLOWED_ACTIONS = {"START", "STOP", "SET_PWM", "FAN_ON", "FAN_OFF"}
+ALLOWED_ACTIONS = {"START", "STOP", "SET_PWM", "FAN_ON", "FAN_OFF", "SET_TARGET_TEMP"}
 DRIVE_ACTIONS = {"START", "SET_PWM"}
 
 
@@ -50,7 +50,7 @@ async def manual_control(req: ManualControlRequest):
     if req.direction is not None and req.direction not in ("forward", "reverse"):
         raise HTTPException(status_code=400, detail="direction must be forward or reverse")
 
-    if req.value is not None and not 0 <= req.value <= 100:
+    if req.value is not None and action != "SET_TARGET_TEMP" and not 0 <= req.value <= 100:
         raise HTTPException(status_code=400, detail="value must be between 0 and 100")
 
     if action in DRIVE_ACTIONS and req.value is None:
