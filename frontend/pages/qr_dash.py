@@ -77,6 +77,7 @@ def get_factory_data(token: str):
         "humidity": api_data["humidity_pct"],
         "updated": _format_time(updated_raw) if updated_raw else "대기 중",
         "peltier": api_data.get("peltier"),
+        "history": api_data.get("history", []),
     }
 
 
@@ -124,6 +125,66 @@ st.markdown(
 """,
     unsafe_allow_html=True,
 )
+
+# 온도/습도 카드
+t = data.get("temp_now")
+h = data.get("humidity")
+tc = "temp-cold" if t is not None and t < -20 else "temp-ok" if t is not None and t < -16 else "temp-warn"
+t_str = f"{t:.1f}" if t is not None else "-"
+h_str = f"{h:.1f}" if h is not None else "-"
+
+st.markdown(f"""
+<div class="card">
+  <div class="card-label">🌡 실시간 내부 온도</div>
+  <div>
+    <span class="card-value {tc}">{t_str}</span>
+    <span class="card-unit">°C</span>
+    &nbsp;&nbsp;
+    <span style="font-family:var(--font-mono);font-size:1rem;color:var(--muted);">습도 {h_str}%</span>
+  </div>
+</div>
+""", unsafe_allow_html=True)
+
+# 24시간 온도 추이 차트
+history = data.get("history", [])
+times, temps = [], []
+for row in history:
+    try:
+        times.append(datetime.fromisoformat(row["timestamp"]))
+        temps.append(row["temperature_c"])
+    except Exception:
+        pass
+
+if times and temps:
+    import plotly.graph_objects as go
+    fig = go.Figure()
+    fig.add_hline(y=-18, line_dash="dot", line_color="#c8d9ec",
+                  annotation_text="-18°C 목표", annotation_position="bottom right",
+                  annotation_font=dict(size=9, color="#6b8299"))
+    fig.add_trace(go.Scatter(
+        x=times, y=temps, mode="lines",
+        line=dict(color="#0077cc", width=2.5, shape="spline"),
+        fill="tozeroy", fillcolor="rgba(0,119,204,0.08)",
+        hovertemplate="%{x|%H:%M}<br><b>%{y}°C</b><extra></extra>",
+        showlegend=False,
+    ))
+    fig.update_layout(
+        paper_bgcolor="white", plot_bgcolor="white",
+        margin=dict(l=10, r=10, t=10, b=10), height=220,
+        xaxis=dict(showgrid=False, zeroline=False, tickfont=dict(size=9, color="#6b8299")),
+        yaxis=dict(showgrid=True, gridcolor="rgba(200,217,236,0.7)", zeroline=False,
+                   tickfont=dict(size=9, color="#6b8299"), range=[-25, -5]),
+    )
+    chart_html = fig.to_html(include_plotlyjs="cdn", full_html=False, config={"displayModeBar": False})
+    import streamlit.components.v1 as components
+    components.html(f"""
+<html><body style="margin:0;padding:0;background:white;">
+<div style="background:white;border:1px solid #c8d9ec;border-radius:16px;padding:1.1rem 1.2rem;">
+  <div style="font-family:monospace;font-size:0.8rem;color:#1a2b3c;letter-spacing:0.12em;text-transform:uppercase;margin-bottom:0.5rem;">24시간 온도 추이</div>
+  {chart_html}
+</div>
+</body></html>
+""", height=290)
 
 peltier = data.get("peltier")
 
