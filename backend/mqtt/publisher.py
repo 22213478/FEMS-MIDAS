@@ -2,8 +2,10 @@ import json
 import os
 import time
 import uuid
-import paho.mqtt.client as mqtt
 from datetime import datetime, timezone
+from typing import Optional
+
+import paho.mqtt.client as mqtt
 
 
 class MQTTPublisher:
@@ -42,7 +44,14 @@ class MQTTPublisher:
         self.client.loop_stop()
         self.client.disconnect()
 
-    def publish_command(self, node_id: str, factory_id: int, action: str, payload: dict = {}):
+    def publish_command(
+        self,
+        node_id: str,
+        factory_id: int,
+        action: str,
+        payload: Optional[dict] = None,
+    ):
+        payload = payload or {}
         message = {
             "command_id": str(uuid.uuid4()),
             "action": action,
@@ -52,6 +61,7 @@ class MQTTPublisher:
         topic = f"factory/{node_id}/{factory_id}/command"
         self.client.publish(topic, json.dumps(message), qos=0)
         print(f"명령 발행: {topic} → {action} {payload}")
+        return {"topic": topic, **message}
 
     def publish_all_stop(self, node_ids: list, reason: str = ""):
         for node_id in node_ids:
