@@ -12,15 +12,21 @@
 #
 # - check_communication_timeout(factory_id)
 #   센서/통신 이상 감지
-#   factories.Last_seen_at 기준 일정 시간 이상 데이터 미수신 시 COMMUNICATION_TIMEOUT 판단
+#   factories.last_seen_at 기준 일정 시간 이상 데이터 미수신 시 COMMUNICATION_TIMEOUT 판단
 #
 # - build_anomaly_result(factory_id, Level, anomaly_type, message)
 #   alert_service.create_alert에서 사용할 수 있는 형태로 이상 감지 결과 생성
 #
 
+from datetime import datetime, timedelta
+from backend.repositories.sensor_log_repository import get_latest_sensor_logs
+from backend.repositories.factory_repository import get_factory_last_seen_times
+from sqlalchemy.ext.asyncio import AsyncSession
+
 TEMP_MIN_C = -22.0
 TEMP_MAX_C = -16.0
 SPIKE_THRESHOLD_C = 5.0
+COMMUNICATION_TIMEOUT_SEC = 180 # 임시 기준: 3분 
 
 def build_anomaly_result(factory_id, level, anomaly_type, message):
     return{
@@ -51,6 +57,23 @@ def check_temperature_range(sensor_log):
 
     return None
 
+async def test_temperature_range_with_db(db: AsyncSession):
+    latest_sensor_logs = await get_latest_sensor_logs(db)
+
+    detected_alerts = []
+
+    for sensor_log in latest_sensor_logs:
+        result = check_temperature_range(sensor_log)
+        if result:
+            detected_alerts.append(result)
+
+    return {
+        "success": True,
+        "checked_count": len(latest_sensor_logs),
+        "alerts_created": len(detected_alerts),
+        "alerts": detected_alerts,
+    }
+
 def check_temperature_spike(current_sensor_log, old_sensor_log):
     if old_sensor_log is None:
         return None
@@ -73,6 +96,32 @@ def check_temperature_spike(current_sensor_log, old_sensor_log):
         )
     return None
 
+def check_communication_timeout(factory):
+    factory_id = factory["factory_id"]
+    last_seen_at = factory.get("last_seen_at")
+
+    if last_seen_at is None:
+        return build_anomaly_result(
+            factory_id,
+            "CRITICAL",
+            "COMMUNICATION_TIMEOUT",
+            f"{factory_id}번 공장 센서 수신 시간이 없습니다."
+        )
+    
+    now = datetime.now()
+    elapsed_sec = (now - last_seen_at).total_seconds() # 경과 시간
+
+    if elapsed_sec >= COMMUNICATION_TIMEOUT_SEC:
+        return build_anomaly_result(
+            factory_id,
+            "CRITICAL",
+            "COMMUNICATION_TIMEOUT",
+            f"{factory_id}번 공장 센서 데이터가 {int(elapsed_sec)}초 동안 수신되지 않았습니다."
+        )
+    
+    return None
+
+
 def run_anomaly_monitoring() -> dict:
     '''
     Job C에서 1분마다 호출할 이상 감지 총괄 함수
@@ -91,6 +140,12 @@ def run_anomaly_monitoring() -> dict:
         4: {"factory_id": 4, "temperature_c": -20.0},
     }
 
+    factories = [
+        {"factory_id": 1, "last_seen_at": datetime.now() - timedelta(seconds=30)},
+        {"factory_id": 3, "last_seen_at": datetime.now() - timedelta(seconds=240)},
+        {"factory_id": 4, "last_seen_at": datetime.now() - timedelta(seconds=10)},
+    ]
+
     detected_alerts = []
 
     for sensor_log in latest_sensor_logs:
@@ -105,10 +160,15 @@ def run_anomaly_monitoring() -> dict:
         spike_result = check_temperature_spike(sensor_log, old_sensor_log)
         if spike_result:
             detected_alerts.append(spike_result)
+    
+    for factory in factories:
+        timeout_result = check_communication_timeout(factory)
+        if timeout_result:
+            detected_alerts.append(timeout_result)
 
     return {
         "success": True,
-        "checked_count": len(latest_sensor_logs),
+        "checked_count": len(latest_sensor_logs) + len(factories),
         "alerts_created": len(detected_alerts),
         "alerts": detected_alerts,
         "message": "anomaly monitoring executed",
