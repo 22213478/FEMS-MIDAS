@@ -19,6 +19,8 @@
 #
 
 from datetime import datetime, timedelta
+from backend.repositories.sensor_log_repository import get_latest_sensor_logs
+from sqlalchemy.ext.asyncio import AsyncSession
 
 TEMP_MIN_C = -22.0
 TEMP_MAX_C = -16.0
@@ -53,6 +55,23 @@ def check_temperature_range(sensor_log):
         )
 
     return None
+
+async def test_temperature_range_with_db(db: AsyncSession):
+    latest_sensor_logs = await get_latest_sensor_logs(db)
+
+    detected_alerts = []
+
+    for sensor_log in latest_sensor_logs:
+        result = check_temperature_range(sensor_log)
+        if result:
+            detected_alerts.append(result)
+
+    return {
+        "success": True,
+        "checked_count": len(latest_sensor_logs),
+        "alerts_created": len(detected_alerts),
+        "alerts": detected_alerts,
+    }
 
 def check_temperature_spike(current_sensor_log, old_sensor_log):
     if old_sensor_log is None:
