@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import importlib
@@ -99,6 +100,7 @@ DEFAULT_DUMMY_DATA_PATH = (
 _SCHEDULER: Any | None = None
 _LAST_JOB_A_RESULT: dict[str, Any] | None = None
 _JOB_A_LOGS: list[dict[str, Any]] = []
+_JOB_A_EXECUTION_LOCK = threading.Lock()
 
 
 @dataclass
@@ -853,13 +855,25 @@ def run_job_a_optimization(
     dry_run: bool = True,
 ) -> dict[str, Any]:
     """동기 호출 호환용 래퍼. 내부 비동기 Job A를 단일 이벤트 루프로 실행한다."""
-    return asyncio.run(
-        run_job_a_optimization_async(
-            now=now,
-            data_path=data_path,
-            dry_run=dry_run,
+    acquired = acquire_job_a_execution_lock(timeout_seconds=1.0)
+    if not acquired:
+        return {
+            "success": False,
+            "skipped": True,
+            "reason": "JOB_A_LOCK_BUSY",
+            "computed_at": (now or datetime.now(timezone.utc)).isoformat(),
+            "schedule_blocks": [],
+        }
+    try:
+        return asyncio.run(
+            run_job_a_optimization_async(
+                now=now,
+                data_path=data_path,
+                dry_run=dry_run,
+            )
         )
-    )
+    finally:
+        release_job_a_execution_lock()
 
 
 def run_job_b_update_environment_weights() -> dict[str, Any]:
@@ -909,6 +923,43 @@ def configure_scheduler_jobs() -> Any:
         replace_existing=True,
     )
     return scheduler
+
+
+def pause_job_a_schedule() -> None:
+    """스케줄러의 주기 Job A를 일시정지한다(데모 수동 실행 충돌 방지용)."""
+    scheduler = get_scheduler()
+    pause = getattr(scheduler, "pause_job", None)
+    if callable(pause):
+        try:
+            pause("job_a_optimization")
+        except Exception:
+            pass
+
+
+def resume_job_a_schedule() -> None:
+    """일시정지된 주기 Job A를 재개한다."""
+    scheduler = get_scheduler()
+    resume = getattr(scheduler, "resume_job", None)
+    if callable(resume):
+        try:
+            resume("job_a_optimization")
+        except Exception:
+            pass
+
+
+def acquire_job_a_execution_lock(timeout_seconds: float = 30.0) -> bool:
+    """Job A 실행 임계영역 lock 획득 시도."""
+    try:
+        timeout = max(0.0, float(timeout_seconds))
+    except Exception:
+        timeout = 30.0
+    return _JOB_A_EXECUTION_LOCK.acquire(timeout=timeout)
+
+
+def release_job_a_execution_lock() -> None:
+    """Job A 실행 임계영역 lock 해제."""
+    if _JOB_A_EXECUTION_LOCK.locked():
+        _JOB_A_EXECUTION_LOCK.release()
 
 
 def get_last_job_a_result() -> dict[str, Any] | None:
