@@ -18,9 +18,9 @@ class MQTTSubscriber:
     def start(self):
         host = os.getenv("MQTT_HOST", "localhost")
         port = int(os.getenv("MQTT_PORT", 1883))
-        self.client.connect(host, port)
         self.client.loop_start()
-        print(f"MQTT 구독 시작: {host}:{port}")
+        self.client.connect_async(host, port)  # 비동기 연결 - 브로커 없어도 재시도
+        print(f"MQTT 구독 시작: {host}:{port} (브로커 켜지면 자동 연결)")
 
     def stop(self):
         self.client.loop_stop()
@@ -78,6 +78,7 @@ class MQTTSubscriber:
                 await session.commit()
                 print(f"저장 완료: factory={payload['factory_id']}, "
                       f"temp={payload.get('temperature_c')}°C, "
-                      f"humidity={payload.get('humidity_pct')}%")
+                      f"humidity={payload.get('humidity_pct')}%, "
+                      f"measured_at={measured_at}")
         except Exception as e:
             print(f"DB 저장 오류: {e}")

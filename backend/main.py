@@ -74,9 +74,12 @@ async def startup():
         print(f"⚠️ MQTT publisher 연결 실패 (브로커 없이 계속): {e}")
 
     # MQTT 구독 시작
-    loop = asyncio.get_event_loop()
-    mqtt_subscriber = MQTTSubscriber(loop)
-    mqtt_subscriber.start()
+    try:
+        loop = asyncio.get_event_loop()
+        mqtt_subscriber = MQTTSubscriber(loop)
+        mqtt_subscriber.start()
+    except Exception as e:
+        print(f"⚠️ MQTT subscriber 연결 실패 (브로커 없이 계속): {e}")
 
     # 스케줄러 시작 (Job A: 30분 주기 최적화, Job C: 1분 주기 이상 감지)
     scheduler = configure_scheduler_jobs()
