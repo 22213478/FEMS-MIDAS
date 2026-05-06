@@ -30,15 +30,15 @@ class MQTTPublisher:
         host = os.getenv("MQTT_HOST", "localhost")
         port = int(os.getenv("MQTT_PORT", 1883))
         print(f"[Publisher] 연결 시도: {host}:{port}")
-        self.client.connect(host, port)
         self.client.loop_start()
-        # CONNACK 수신까지 최대 5초 대기
+        self.client.connect_async(host, port)  # 비동기 연결 - 실패해도 루프가 계속 재시도
+        # CONNACK 수신까지 최대 5초 대기 (실패해도 백그라운드에서 계속 재시도)
         for _ in range(50):
             if self._connected:
                 break
             time.sleep(0.1)
         if not self._connected:
-            print(f"⚠️ MQTT publisher 연결 대기 시간 초과 ({host}:{port})")
+            print(f"⚠️ MQTT publisher 브로커 없음 - 브로커 켜지면 자동 재연결")
 
     def disconnect(self):
         self.client.loop_stop()
