@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import importlib
@@ -99,6 +100,7 @@ DEFAULT_DUMMY_DATA_PATH = (
 _SCHEDULER: Any | None = None
 _LAST_JOB_A_RESULT: dict[str, Any] | None = None
 _JOB_A_LOGS: list[dict[str, Any]] = []
+_JOB_A_EXECUTION_LOCK = threading.Lock()
 
 
 @dataclass
@@ -311,7 +313,7 @@ def _outdoor_temp_forecast_for_horizon(
     return rows
 
 
-def _service_outdoor_temp_forecast_for_horizon(
+async def _service_outdoor_temp_forecast_for_horizon(
     now: datetime,
     deadline: datetime | None,
     env_weights: dict[str, Any],
@@ -327,8 +329,8 @@ def _service_outdoor_temp_forecast_for_horizon(
     ny = int(env_weights.get("kma_ny", 127))
 
     try:
-        today_rows = asyncio.run(weather_service.fetch_today_forecast(nx=nx, ny=ny))
-        tomorrow_rows = asyncio.run(weather_service.fetch_tomorrow_forecast(nx=nx, ny=ny))
+        today_rows = await weather_service.fetch_today_forecast(nx=nx, ny=ny)
+        tomorrow_rows = await weather_service.fetch_tomorrow_forecast(nx=nx, ny=ny)
     except Exception:
         return []
 
@@ -363,7 +365,7 @@ def _service_outdoor_temp_forecast_for_horizon(
     return converted
 
 
-def _resolve_outdoor_temp_forecast(
+async def _resolve_outdoor_temp_forecast(
     data: dict[str, Any],
     now: datetime,
     deadline: datetime | None,
@@ -372,7 +374,7 @@ def _resolve_outdoor_temp_forecast(
     """외기온 예보 입력을 서비스 우선으로 구성하고 실패 시 더미로 폴백한다."""
     use_service_weather = bool(env_weights.get("use_service_weather", True))
     if use_service_weather:
-        service_rows = _service_outdoor_temp_forecast_for_horizon(
+        service_rows = await _service_outdoor_temp_forecast_for_horizon(
             now=now,
             deadline=deadline,
             env_weights=env_weights,
@@ -405,6 +407,102 @@ def _planned_inbound_by_factory(
         planned_units = float(row.get("planned_inbound_units_until_deadline", 0.0) or 0.0)
         result[factory_id] = max(0.0, planned_units)
     return result
+
+
+async def _load_db_inbound_by_factory(
+    available_factory_ids: set[int],
+) -> tuple[dict[int, float], str]:
+    """DB jobs 테이블에서 공장별 최신 quantity를 읽어 입고 계획 맵으로 변환한다."""
+    if not available_factory_ids:
+        return {}, "DB_NO_FACTORIES"
+
+    try:
+        from backend.database.connection import AsyncSessionLocal
+        from backend.database.models import Job
+        from sqlalchemy import select
+    except Exception:
+        try:
+            from database.connection import AsyncSessionLocal
+            from database.models import Job
+            from sqlalchemy import select
+        except Exception:
+            return {}, "DB_IMPORT_ERROR"
+
+    inbound_by_factory: dict[int, float] = {}
+    try:
+        async with AsyncSessionLocal() as session:
+            stmt = (
+                select(Job.factory_id, Job.quantity, Job.created_at)
+                .where(Job.factory_id.is_not(None))
+                .order_by(Job.created_at.desc())
+            )
+            rows = (await session.execute(stmt)).all()
+    except Exception:
+        return {}, "DB_QUERY_ERROR"
+
+    for row in rows:
+        try:
+            factory_id = int(row[0])
+        except (TypeError, ValueError):
+            continue
+        if factory_id not in available_factory_ids:
+            continue
+        # created_at DESC 정렬이므로 공장별 첫 행이 최신 quantity다.
+        if factory_id in inbound_by_factory:
+            continue
+        try:
+            qty = float(row[1] or 0.0)
+        except (TypeError, ValueError):
+            qty = 0.0
+        inbound_by_factory[factory_id] = max(0.0, qty)
+
+    if not inbound_by_factory:
+        return {}, "DB_EMPTY"
+    return inbound_by_factory, "DB_JOBS_QUANTITY"
+
+
+def _planned_inbound_by_factory_with_db_fallback(
+    data: dict[str, Any],
+    job_id: str | None,
+    available_factory_ids: set[int],
+) -> tuple[dict[int, float], str]:
+    """입고량을 DB(jobs.quantity)에서 우선 조회하고 실패/공백이면 더미로 폴백한다."""
+    try:
+        try:
+            loop = asyncio.get_running_loop()
+            future = asyncio.run_coroutine_threadsafe(
+                _load_db_inbound_by_factory(available_factory_ids),
+                loop,
+            )
+            db_map, db_reason = future.result(timeout=5)
+        except RuntimeError:
+            db_map, db_reason = asyncio.run(_load_db_inbound_by_factory(available_factory_ids))
+    except Exception:
+        db_map, db_reason = {}, "DB_EXEC_ERROR"
+
+    if db_map:
+        return db_map, db_reason
+
+    dummy_map = _planned_inbound_by_factory(data, job_id, available_factory_ids)
+    return dummy_map, f"DUMMY_FALLBACK({db_reason})"
+
+
+async def _planned_inbound_by_factory_with_db_fallback_async(
+    data: dict[str, Any],
+    job_id: str | None,
+    available_factory_ids: set[int],
+) -> tuple[dict[int, float], str]:
+    """비동기 경로용: 입고량을 DB 우선 조회하고 실패/공백이면 더미로 폴백한다."""
+    try:
+        db_map, db_reason = await _load_db_inbound_by_factory(available_factory_ids)
+    except Exception:
+        db_map, db_reason = {}, "DB_EXEC_ERROR"
+
+    if db_map:
+        return db_map, db_reason
+
+    dummy_map = _planned_inbound_by_factory(data, job_id, available_factory_ids)
+    return dummy_map, f"DUMMY_FALLBACK({db_reason})"
 
 
 def _planned_shipment_by_factory(
@@ -550,7 +648,7 @@ async def _save_blocks_to_db(blocks: list[dict[str, Any]]) -> None:
         print(f"[Job A] schedules 저장 완료: {len(valid_blocks)}개")
 
 
-def run_job_a_optimization(
+async def run_job_a_optimization_async(
     *,
     now: datetime | None = None,
     data_path: Path = DEFAULT_DUMMY_DATA_PATH,
@@ -579,9 +677,9 @@ def run_job_a_optimization(
     pricing_tou = data.get("pricing_tou", {})
     tou_price, tou_price_source = get_tou_price_with_source(resolved_now, pricing_tou)
     deadline = _parse_iso(active_job.get("deadline_at"))
-    env_weights = data.get("environment_weights", {})
+    env_weights = dict(data.get("environment_weights", {}) or {})
     solar_forecast = _solar_forecast_for_horizon(data, resolved_now, deadline)
-    outdoor_temp_forecast, outdoor_temp_source = _resolve_outdoor_temp_forecast(
+    outdoor_temp_forecast, outdoor_temp_source = await _resolve_outdoor_temp_forecast(
         data=data,
         now=resolved_now,
         deadline=deadline,
@@ -589,7 +687,7 @@ def run_job_a_optimization(
     )
 
     available_factory_ids = {int(factory.get("factory_id")) for factory in factories if "factory_id" in factory}
-    planned_inbound_by_factory = _planned_inbound_by_factory(
+    planned_inbound_by_factory, inbound_source = await _planned_inbound_by_factory_with_db_fallback_async(
         data,
         active_job.get("job_id"),
         available_factory_ids,
@@ -611,6 +709,35 @@ def run_job_a_optimization(
         optimization_job["planned_inbound_by_factory"] = {
             str(factory_id): units for factory_id, units in planned_inbound_by_factory.items()
         }
+        # 데모용 DB 연동 강화:
+        # 공장 수가 1개인 환경에서는 planned_inbound_by_factory가 '분배 비율'에 영향을 주기 어려워
+        # 권장온도 변화가 잘 나타나지 않는다. 따라서 DB에서 온 jobs.quantity(입고 총량)을
+        # 남은 생산/입고량(remaining_units)의 스케일에도 연결해 민감도를 확보한다.
+        if inbound_source == "DB_JOBS_QUANTITY":
+            try:
+                produced_units = float(active_job.get("produced_units", 0) or 0.0)
+            except (TypeError, ValueError):
+                produced_units = 0.0
+            total_qty = 0.0
+            for v in planned_inbound_by_factory.values():
+                try:
+                    total_qty += float(v or 0.0)
+                except (TypeError, ValueError):
+                    continue
+            total_qty = max(0.0, total_qty)
+            # remaining_units = target_units - produced_units 가 total_qty가 되도록 target_units를 재설정
+            optimization_job["target_units"] = int(round(produced_units + total_qty))
+            # 데모에서 수량 변화가 30분 슬롯 입고량으로 더 크게 반영되도록 계획 지평을 단축한다.
+            # optimization_service에서 effective_planning_hours는 최소 6h 이므로 6h로 고정해 민감도를 확보한다.
+            optimization_job["thermal_planning_hours"] = 6.0
+
+            # 데모에서 수량 증가 → 권장온도 하강이 눈에 보이도록 입고 관련 가중치를 강화한다.
+            # (실운영에서는 튜닝 대상이며, 데모 범위에서는 효과를 명확히 보여주는 것이 목적)
+            env_weights["inbound_cooling_penalty_weight"] = float(env_weights.get("inbound_cooling_penalty_weight", 45.0)) * 6.0
+            env_weights["inbound_cooling_c_per_unit"] = max(
+                float(env_weights.get("inbound_cooling_c_per_unit", 0.09)),
+                0.18,
+            )
     if planned_shipment_by_factory:
         optimization_job["planned_shipment_by_factory"] = {
             str(factory_id): units for factory_id, units in planned_shipment_by_factory.items()
@@ -665,6 +792,11 @@ def run_job_a_optimization(
         "outdoor_temp_source": outdoor_temp_source,
         "remaining_units": remaining_units,
         "factory_count": len(factories),
+        "inbound_source": inbound_source,
+        "planned_inbound_by_factory": {
+            str(factory_id): round(units, 3)
+            for factory_id, units in sorted(planned_inbound_by_factory.items())
+        },
         "schedule_blocks": blocks,
         "applied": not dry_run,
     }
@@ -673,12 +805,7 @@ def run_job_a_optimization(
 
     if not dry_run and blocks:
         try:
-            try:
-                loop = asyncio.get_running_loop()
-                future = asyncio.run_coroutine_threadsafe(_save_blocks_to_db(blocks), loop)
-                future.result(timeout=30)
-            except RuntimeError:
-                asyncio.run(_save_blocks_to_db(blocks))
+            await _save_blocks_to_db(blocks)
             result["db_saved"] = True
         except Exception as e:
             result["db_saved"] = False
@@ -709,7 +836,44 @@ def run_job_a_optimization(
 
     _LAST_JOB_A_RESULT = result
     _JOB_A_LOGS.append(result)
+    if blocks:
+        for block in blocks:
+            factory_id = int(block.get("factory_id", 0) or 0)
+            inbound_units = planned_inbound_by_factory.get(factory_id, 0.0)
+            recommended_temp = block.get("recommended_temp_c", block.get("target_temp_c"))
+            print(
+                f"[Job A] factory={factory_id} inbound_units={inbound_units:.2f} "
+                f"recommended_temp_c={recommended_temp}"
+            )
     return result
+
+
+def run_job_a_optimization(
+    *,
+    now: datetime | None = None,
+    data_path: Path = DEFAULT_DUMMY_DATA_PATH,
+    dry_run: bool = True,
+) -> dict[str, Any]:
+    """동기 호출 호환용 래퍼. 내부 비동기 Job A를 단일 이벤트 루프로 실행한다."""
+    acquired = acquire_job_a_execution_lock(timeout_seconds=1.0)
+    if not acquired:
+        return {
+            "success": False,
+            "skipped": True,
+            "reason": "JOB_A_LOCK_BUSY",
+            "computed_at": (now or datetime.now(timezone.utc)).isoformat(),
+            "schedule_blocks": [],
+        }
+    try:
+        return asyncio.run(
+            run_job_a_optimization_async(
+                now=now,
+                data_path=data_path,
+                dry_run=dry_run,
+            )
+        )
+    finally:
+        release_job_a_execution_lock()
 
 
 def run_job_b_update_environment_weights() -> dict[str, Any]:
@@ -759,6 +923,43 @@ def configure_scheduler_jobs() -> Any:
         replace_existing=True,
     )
     return scheduler
+
+
+def pause_job_a_schedule() -> None:
+    """스케줄러의 주기 Job A를 일시정지한다(데모 수동 실행 충돌 방지용)."""
+    scheduler = get_scheduler()
+    pause = getattr(scheduler, "pause_job", None)
+    if callable(pause):
+        try:
+            pause("job_a_optimization")
+        except Exception:
+            pass
+
+
+def resume_job_a_schedule() -> None:
+    """일시정지된 주기 Job A를 재개한다."""
+    scheduler = get_scheduler()
+    resume = getattr(scheduler, "resume_job", None)
+    if callable(resume):
+        try:
+            resume("job_a_optimization")
+        except Exception:
+            pass
+
+
+def acquire_job_a_execution_lock(timeout_seconds: float = 30.0) -> bool:
+    """Job A 실행 임계영역 lock 획득 시도."""
+    try:
+        timeout = max(0.0, float(timeout_seconds))
+    except Exception:
+        timeout = 30.0
+    return _JOB_A_EXECUTION_LOCK.acquire(timeout=timeout)
+
+
+def release_job_a_execution_lock() -> None:
+    """Job A 실행 임계영역 lock 해제."""
+    if _JOB_A_EXECUTION_LOCK.locked():
+        _JOB_A_EXECUTION_LOCK.release()
 
 
 def get_last_job_a_result() -> dict[str, Any] | None:
