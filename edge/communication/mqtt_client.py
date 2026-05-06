@@ -34,9 +34,10 @@ class EdgeMQTTClient:
     def reconnect_if_needed(self):
         if not self._connected:
             try:
-                self.client.reconnect()
-            except Exception:
-                pass
+                self.client.connect(self._host, self._port)
+                print(f"MQTT 재연결 시도: {self._host}:{self._port}")
+            except Exception as e:
+                print(f"MQTT 재연결 실패: {e}")
 
     def disconnect(self):
         self.client.loop_stop()
