@@ -330,6 +330,10 @@
   // ── 환경 가중치 (기상청 API 기반, 매일 18시 갱신) ─────────────────
   "environment_weights": {
     "date": "2026-04-03",                     // 내일 예측 기준
+    // 태양광 NWP 서비스: true면 prediction_service(키 필요). 데모 타임라인 고정이면 false로 더미 predict_solar 사용
+    "use_service_solar": false,
+    "kma_lat": 35.8,                          // NWP 지점 위도 — 영남대학교 IT관
+    "kma_lon": 128.7,                         // NWP 지점 경도 — 영남대학교 IT관
     "w_temp": 1.0,                            // 평년 수준 (폭염이면 1.2)
     "w_solar": 0.5,                           // 흐린 날 (맑으면 1.0, 비면 0.2)
     "inbound_cooling_c_per_unit": 0.09,       // 입고 1단위당 필요한 추가 냉각량(도씨 환산)

@@ -73,12 +73,34 @@ if load_dotenv is not None:
 try:
     from backend.services import tou_service
 except Exception:  # pragma: no cover - optional integration fallback
-    tou_service = None  # type: ignore
+    try:
+        from services import tou_service  # type: ignore
+    except Exception:
+        tou_service = None  # type: ignore
 
 try:
     from backend.services import weather_service
 except Exception:  # pragma: no cover - optional integration fallback
-    weather_service = None  # type: ignore
+    try:
+        from services import weather_service  # type: ignore
+    except Exception:
+        weather_service = None  # type: ignore
+
+try:
+    from backend.services import prediction_service
+except Exception:  # pragma: no cover - optional integration fallback
+    try:
+        from services import prediction_service  # type: ignore
+    except Exception:
+        prediction_service = None  # type: ignore
+
+try:
+    from backend.services import optimization_service  # type: ignore
+except Exception:
+    try:
+        from services import optimization_service  # type: ignore
+    except Exception:
+        optimization_service = None  # type: ignore
 
 try:
     from backend.services import anomaly_service
@@ -293,6 +315,88 @@ def _solar_forecast_for_horizon(
     return rows
 
 
+def _normalize_ts_for_compare(ts: datetime, ref: datetime) -> datetime:
+    """aware/naive 혼용 비교를 피하기 위해 기준 시각(ref) 형태로 정규화한다."""
+    if ref.tzinfo is None and ts.tzinfo is not None:
+        return ts.replace(tzinfo=None)
+    if ref.tzinfo is not None and ts.tzinfo is None:
+        return ts.replace(tzinfo=ref.tzinfo)
+    return ts
+
+
+def _service_solar_forecast_for_horizon(
+    now: datetime,
+    deadline: datetime | None,
+    env_weights: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """prediction_service.predict_solar를 사용해 horizon 범위 태양광 예측을 구성한다."""
+    if prediction_service is None or not hasattr(prediction_service, "predict_solar"):
+        return []
+
+    if deadline is None or deadline <= now:
+        deadline = now + timedelta(hours=24)
+
+    lat = float(env_weights.get("kma_lat", 37.5))
+    lon = float(env_weights.get("kma_lon", 127.0))
+
+    start_day = now.date()
+    end_day = deadline.date()
+    day_cursor = start_day
+    rows: list[dict[str, Any]] = []
+
+    while day_cursor <= end_day:
+        target = day_cursor.strftime("%Y%m%d")
+        try:
+            daily_rows = asyncio.run(
+                prediction_service.predict_solar(
+                    target_date=target,
+                    lat=lat,
+                    lon=lon,
+                )
+            )
+        except Exception:
+            daily_rows = []
+
+        for row in daily_rows:
+            if not isinstance(row, dict):
+                continue
+            ts = _parse_iso(row.get("timestamp"))
+            if ts is None:
+                continue
+            ts_cmp = _normalize_ts_for_compare(ts, now)
+            if now <= ts_cmp <= deadline:
+                rows.append(
+                    {
+                        "timestamp": ts.isoformat(),
+                        "predicted_solar_kwh": float(row.get("predicted_solar_kwh", 0.0)),
+                    }
+                )
+
+        day_cursor += timedelta(days=1)
+
+    rows.sort(key=lambda x: str(x.get("timestamp", "")))
+    return rows
+
+
+def _resolve_solar_forecast(
+    data: dict[str, Any],
+    now: datetime,
+    deadline: datetime | None,
+    env_weights: dict[str, Any],
+) -> tuple[list[dict[str, Any]], str]:
+    """태양광 예측 입력을 서비스 우선으로 구성하고 실패 시 더미로 폴백한다."""
+    use_service_solar = bool(env_weights.get("use_service_solar", True))
+    if use_service_solar:
+        service_rows = _service_solar_forecast_for_horizon(
+            now=now,
+            deadline=deadline,
+            env_weights=env_weights,
+        )
+        if service_rows:
+            return service_rows, "SERVICE"
+    return _solar_forecast_for_horizon(data, now, deadline), "DUMMY"
+
+
 def _outdoor_temp_forecast_for_horizon(
     data: dict[str, Any],
     now: datetime,
@@ -491,13 +595,9 @@ def _heuristic_blocks(ctx: JobAContext) -> list[dict[str, Any]]:
 
 def _run_optimization_with_fallback(ctx: JobAContext) -> list[dict[str, Any]]:
     """optimization_service.run_optimization이 있으면 호출하고, 없으면 휴리스틱으로 대체한다."""
-    try:
-        from backend.services import optimization_service  # type: ignore
-    except Exception:
-        optimization_service = None  # type: ignore
-
-    if optimization_service and hasattr(optimization_service, "run_optimization"):
-        return optimization_service.run_optimization(  # type: ignore[no-any-return]
+    opt = optimization_service
+    if opt is not None and hasattr(opt, "run_optimization"):
+        return opt.run_optimization(  # type: ignore[no-any-return]
             job=ctx.active_job,
             sensor_states=ctx.factories,
             tou_prices=ctx.tou_slots,
@@ -580,7 +680,12 @@ def run_job_a_optimization(
     tou_price, tou_price_source = get_tou_price_with_source(resolved_now, pricing_tou)
     deadline = _parse_iso(active_job.get("deadline_at"))
     env_weights = data.get("environment_weights", {})
-    solar_forecast = _solar_forecast_for_horizon(data, resolved_now, deadline)
+    solar_forecast, solar_forecast_source = _resolve_solar_forecast(
+        data=data,
+        now=resolved_now,
+        deadline=deadline,
+        env_weights=env_weights,
+    )
     outdoor_temp_forecast, outdoor_temp_source = _resolve_outdoor_temp_forecast(
         data=data,
         now=resolved_now,
@@ -644,13 +749,9 @@ def run_job_a_optimization(
     )
     blocks = _run_optimization_with_fallback(ctx)
     optimization_debug: dict[str, Any] | None = None
-    try:
-        from backend.services import optimization_service  # type: ignore
-
-        if hasattr(optimization_service, "get_last_optimization_debug"):
-            optimization_debug = optimization_service.get_last_optimization_debug()  # type: ignore[assignment]
-    except Exception:
-        optimization_debug = None
+    opt = optimization_service
+    if opt is not None and hasattr(opt, "get_last_optimization_debug"):
+        optimization_debug = opt.get_last_optimization_debug()  # type: ignore[assignment]
 
     target_units = int(active_job.get("target_units", 0))
     produced_units = int(active_job.get("produced_units", 0))
@@ -662,6 +763,7 @@ def run_job_a_optimization(
         "job_id": active_job.get("job_id"),
         "tou_price_krw_per_kwh": tou_price,
         "tou_price_source": tou_price_source,
+        "solar_forecast_source": solar_forecast_source,
         "outdoor_temp_source": outdoor_temp_source,
         "remaining_units": remaining_units,
         "factory_count": len(factories),
