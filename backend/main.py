@@ -18,7 +18,7 @@ from sqlalchemy import text
 from database.connection import engine, create_all_tables
 from mqtt.subscriber import MQTTSubscriber
 from mqtt.publisher import publisher
-from scheduler.jobs import configure_scheduler_jobs, pause_job_a_schedule
+from scheduler.jobs import configure_scheduler_jobs
 from routers.readonly import router as readonly_router
 from routers.control import router as control_router
 from routers.weather import router as weather_router
@@ -26,7 +26,6 @@ from routers.energy import router as energy_router
 from routers.operations import router as operations_router
 from routers.sensors import router as sensors_router
 from routers.analytics import router as analytics_router
-from routers.demo_dynamic import router as demo_dynamic_router
 
 app = FastAPI()
 mqtt_subscriber: MQTTSubscriber = None
@@ -46,7 +45,6 @@ app.include_router(energy_router)
 app.include_router(operations_router)
 app.include_router(sensors_router)
 app.include_router(analytics_router)
-app.include_router(demo_dynamic_router)
 
 @app.get("/favicon.ico", include_in_schema=False)
 async def favicon():
@@ -86,11 +84,19 @@ async def startup():
     # 스케줄러 시작 (Job A: 30분 주기 최적화, Job C: 1분 주기 이상 감지)
     scheduler = configure_scheduler_jobs()
     scheduler.start()
-    # 데모 안정화를 위해 주기 Job A는 잠시 비활성화하고, 버튼 실행 경로만 사용한다.
-    pause_job_a_schedule()
     print("✅ 스케줄러 시작")
 
-    # 데모 모드에서는 startup 시 초기 Job A 1회 실행도 비활성화한다.
+    # 초기 최적화 1회 실행 (별도 스레드에서 실행해야 asyncio.run 충돌 없음)
+    import threading
+    from scheduler.jobs import run_job_a_optimization
+
+    def _initial_run():
+        result = run_job_a_optimization(dry_run=False)
+        print(f"[Job A] blocks={len(result.get('schedule_blocks', []))}, db_saved={result.get('db_saved')}, db_error={result.get('db_error')}, skipped={result.get('skipped')}, reason={result.get('reason')}")
+        for block in result.get("schedule_blocks", []):
+            print(f"  공장 {block['factory_id']} | 권장 온도: {block.get('recommended_temp_c', block.get('target_temp_c'))}°C | 모드: {block.get('mode')}")
+
+    threading.Thread(target=_initial_run, daemon=True).start()
 
 
 @app.on_event("shutdown")
