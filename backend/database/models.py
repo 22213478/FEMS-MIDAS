@@ -77,3 +77,14 @@ class SensorLog(Base):
     humidity_pct = Column(Numeric(5, 2))
     measured_at = Column(DateTime(timezone=True))
     logged_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+
+class ReadonlyToken(Base):
+    __tablename__ = "readonly_tokens"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    factory_id = Column(BigInteger, nullable=False)
+    token = Column(String(255), nullable=False, unique=True, index=True)
+    is_active = Column(Boolean, nullable=False, server_default="true")
+    expires_at = Column(DateTime(timezone=True))
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
