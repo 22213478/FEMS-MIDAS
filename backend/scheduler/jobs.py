@@ -378,18 +378,76 @@ def _service_solar_forecast_for_horizon(
     return rows
 
 
+def _resolve_prophet_alpha_override(
+    env_weights: dict[str, Any],
+    actual: list[dict[str, Any]],
+    nwp: list[dict[str, Any]],
+    fallback_window: int,
+    *,
+    daily_alpha_series_fn: Any,
+) -> tuple[float | None, dict[str, Any] | None]:
+    """``use_solar_prophet_alpha`` 가 true일 때 Prophet α 예측을 시도한다.
+
+    실패·미설치·일수 부족 시 ``(None, meta)`` 로 폴백(=apply_solar_calibration에서
+    rolling mean α가 사용됨). Job A 결과 meta에는 항상 Prophet 메타가 함께 실린다.
+    """
+    if not env_weights.get("use_solar_prophet_alpha"):
+        return None, None
+
+    try:
+        from backend.services.solar_prophet import forecast_alpha_for_date
+    except ImportError:
+        try:
+            from services.solar_prophet import forecast_alpha_for_date  # type: ignore
+        except ImportError:
+            return None, {
+                "alpha_forecast": None,
+                "source": "module_unavailable",
+                "error": "solar_prophet import failed",
+            }
+
+    try:
+        prophet_window = int(env_weights.get("solar_prophet_window_days", fallback_window))
+    except (TypeError, ValueError):
+        prophet_window = fallback_window
+    try:
+        min_rows = int(env_weights.get("solar_prophet_min_rows", 14))
+    except (TypeError, ValueError):
+        min_rows = 14
+
+    series = daily_alpha_series_fn(actual, nwp)
+    prophet_meta = forecast_alpha_for_date(
+        series,
+        window_days=prophet_window,
+        min_rows=min_rows,
+    )
+    alpha_forecast = prophet_meta.get("alpha_forecast")
+    override = (
+        float(alpha_forecast)
+        if isinstance(alpha_forecast, (int, float)) and float(alpha_forecast) > 0
+        else None
+    )
+    return override, prophet_meta
+
+
 def _apply_solar_calibration_from_data(
     data: dict[str, Any],
     env_weights: dict[str, Any],
     rows: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
-    """일별 실측·NWP 쌍으로 1차 보정(scale / residual_mean / scale_and_residual)."""
+    """일별 실측·NWP 쌍으로 1차 보정(scale / residual_mean / scale_and_residual).
+
+    ``use_solar_prophet_alpha`` 가 true이면 ``solar_prophet.forecast_alpha_for_date``
+    결과를 ``apply_solar_calibration(alpha_override=...)`` 로 전달해 rolling mean α를
+    대체한다. Prophet 메타는 ``meta["prophet"]`` 에 보관(실측·디버깅용).
+    """
     if not env_weights.get("use_dummy_solar_calibration"):
         return rows, None
     try:
         from backend.services.solar_calibration import (
             apply_solar_calibration,
             calibration_daily_rows_from_data,
+            daily_alpha_series,
             parse_calibration_mode,
         )
     except ImportError:
@@ -397,6 +455,7 @@ def _apply_solar_calibration_from_data(
             from services.solar_calibration import (
                 apply_solar_calibration,
                 calibration_daily_rows_from_data,
+                daily_alpha_series,
                 parse_calibration_mode,
             )
         except ImportError:
@@ -413,6 +472,15 @@ def _apply_solar_calibration_from_data(
     if dist not in ("proportional", "uniform"):
         dist = "proportional"
     mode = parse_calibration_mode(env_weights)
+
+    alpha_override, prophet_meta = _resolve_prophet_alpha_override(
+        env_weights,
+        actual,
+        nwp,
+        fallback_window=window,
+        daily_alpha_series_fn=daily_alpha_series,
+    )
+
     rows_out, meta = apply_solar_calibration(
         rows,
         actual,
@@ -420,7 +488,10 @@ def _apply_solar_calibration_from_data(
         mode=mode,
         window_days=window,
         residual_distribution=dist,  # type: ignore[arg-type]
+        alpha_override=alpha_override,
     )
+    if prophet_meta is not None:
+        meta["prophet"] = prophet_meta
     if not meta.get("applied"):
         return rows, None
     return rows_out, meta
@@ -836,6 +907,27 @@ def run_job_a_optimization(
         ),
         "solar_calibration_applied": (
             bool(solar_calibration_meta.get("applied")) if solar_calibration_meta else False
+        ),
+        "solar_alpha_source": (
+            solar_calibration_meta.get("alpha_source") if solar_calibration_meta else None
+        ),
+        "solar_rolling_alpha": (
+            solar_calibration_meta.get("rolling_alpha") if solar_calibration_meta else None
+        ),
+        "solar_alpha_forecast": (
+            (solar_calibration_meta.get("prophet") or {}).get("alpha_forecast")
+            if solar_calibration_meta
+            else None
+        ),
+        "solar_prophet_source": (
+            (solar_calibration_meta.get("prophet") or {}).get("source")
+            if solar_calibration_meta
+            else None
+        ),
+        "solar_prophet_forecast_date": (
+            (solar_calibration_meta.get("prophet") or {}).get("forecast_date")
+            if solar_calibration_meta
+            else None
         ),
         "outdoor_temp_source": outdoor_temp_source,
         "remaining_units": remaining_units,

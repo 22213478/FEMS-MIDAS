@@ -199,12 +199,25 @@ def apply_solar_calibration(
     mode: CalibrationMode = "scale",
     window_days: int = 30,
     residual_distribution: Literal["proportional", "uniform"] = "proportional",
+    alpha_override: float | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """시간별 태양광 예측에 1차 보정 적용. meta에 α·잔차·일별 시계열 요약."""
+    """시간별 태양광 예측에 1차 보정 적용. meta에 α·잔차·일별 시계열 요약.
+
+    ``alpha_override``: 외부에서 계산한 α(예: Prophet ``alpha_forecast``)가 있으면
+    rolling mean α 대신 이 값으로 스케일한다. 양수일 때만 적용되며, 비교 가능하도록
+    ``meta["rolling_alpha"]``에는 rolling 결과를 항상 함께 기록한다.
+
+    ``meta["alpha_source"]``:
+        - ``"override"``  — ``alpha_override`` 사용 (Prophet 경로)
+        - ``"rolling_mean"`` — 기존 ``alpha_from_daily_pairs`` 결과
+        - ``None`` — α를 만들 수 없는 입력(빈 행 등)
+    """
     meta: dict[str, Any] = {
         "mode": mode,
         "window_days": window_days,
         "alpha": None,
+        "alpha_source": None,
+        "rolling_alpha": None,
         "mean_residual_kwh": None,
         "daily_alpha_series": daily_alpha_series(actual_rows, nwp_rows),
         "daily_residual_series": residuals_from_daily_pairs(actual_rows, nwp_rows),
@@ -214,10 +227,23 @@ def apply_solar_calibration(
         return [dict(r) for r in hourly_rows], meta
 
     rows = [dict(r) for r in hourly_rows]
-    alpha = alpha_from_daily_pairs(actual_rows, nwp_rows, window_days=window_days)
+    rolling_alpha = alpha_from_daily_pairs(actual_rows, nwp_rows, window_days=window_days)
     mean_res = mean_residual_kwh(actual_rows, nwp_rows, window_days=window_days)
-    meta["alpha"] = alpha
+    meta["rolling_alpha"] = rolling_alpha
     meta["mean_residual_kwh"] = mean_res
+
+    # alpha_override가 양수이면 우선 사용; 0 이하·None이면 rolling으로 폴백.
+    if alpha_override is not None and alpha_override > 0:
+        alpha: float | None = float(alpha_override)
+        alpha_source: str | None = "override"
+    elif rolling_alpha is not None:
+        alpha = rolling_alpha
+        alpha_source = "rolling_mean"
+    else:
+        alpha = None
+        alpha_source = None
+    meta["alpha"] = alpha
+    meta["alpha_source"] = alpha_source
 
     if mode in ("scale", "scale_and_residual") and alpha is not None and alpha > 0:
         rows = scale_forecast_hourly(rows, alpha)

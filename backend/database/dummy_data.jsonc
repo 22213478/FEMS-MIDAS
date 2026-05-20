@@ -339,6 +339,11 @@
     "solar_calibration_mode": "scale",
     "solar_calibration_data_source": "main",
     "solar_calibration_residual_distribution": "proportional",
+    // ③ Prophet α 보정 (D1·D5~D7): true면 daily_alpha_series로 Prophet 학습해 내일 α 예측.
+    // true(기본): Prophet α 우선. 미설치·학습 실패·일수 부족 시 rolling mean fallback.
+    "use_solar_prophet_alpha": true,
+    "solar_prophet_window_days": 30,
+    "solar_prophet_min_rows": 14,
     "kma_lat": 35.8,                          // NWP 지점 위도 — 영남대학교 IT관
     "kma_lon": 128.7,                         // NWP 지점 경도 — 영남대학교 IT관
     "w_temp": 1.0,                            // 평년 수준 (폭염이면 1.2)
