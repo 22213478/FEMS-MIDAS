@@ -111,6 +111,7 @@ async def _fetch_nwp_var(
     lat: float,
     lon: float,
     nwp_model: str = "KIMR",
+    tm: str | None = None,
 ) -> list[tuple[datetime, float]]:
     start_kst = datetime.combine(target_date_kst, time.min, tzinfo=KST)
     end_kst = datetime.combine(target_date_kst, time.max, tzinfo=KST)
@@ -121,7 +122,7 @@ async def _fetch_nwp_var(
         "authKey": auth_key,
         "nwp": nwp_model,
         "varn": varn,
-        "tm": _latest_tm_utc(),
+        "tm": tm if tm is not None else _latest_tm_utc(),
         "tmef1": start_utc.strftime("%Y%m%d%H%M"),
         "tmef2": end_utc.strftime("%Y%m%d%H%M"),
         "int": "3",
@@ -185,6 +186,7 @@ async def predict_solar(
     *,
     lat: float = 37.5,
     lon: float = 127.0,
+    tm: str | None = None,
 ) -> list[dict[str, Any]]:
     """
     다음날 시간대별 태양광 예상 발전량(kWh)을 반환한다.
@@ -194,6 +196,7 @@ async def predict_solar(
       {"timestamp": "...+09:00", "predicted_solar_kwh": 0.123},
       ...
     ]
+    tm: API `tm`(UTC 기준 YYYYmmddHH). None이면 현재 시각 기준 최근 6시간 단위 발표시각(기존 동작).
     """
     auth_key = os.getenv("KMA_APIHUB_AUTH_KEY")
     target_day = _parse_target_date(target_date)
@@ -208,6 +211,7 @@ async def predict_solar(
             target_date_kst=target_day,
             lat=lat,
             lon=lon,
+            tm=tm,
         )
         tmp_rows = await _fetch_nwp_var(
             auth_key=auth_key,
@@ -215,6 +219,7 @@ async def predict_solar(
             target_date_kst=target_day,
             lat=lat,
             lon=lon,
+            tm=tm,
         )
     except Exception:
         return _fallback_curve(target_day)
@@ -254,9 +259,10 @@ async def predict_solar_daily_total(
     *,
     lat: float = 37.5,
     lon: float = 127.0,
+    tm: str | None = None,
 ) -> dict[str, Any]:
     """다음날 총 예상 발전량(kWh)만 필요할 때 사용하는 요약 함수."""
-    hourly = await predict_solar(target_date=target_date, lat=lat, lon=lon)
+    hourly = await predict_solar(target_date=target_date, lat=lat, lon=lon, tm=tm)
     total_kwh = round(sum(float(r.get("predicted_solar_kwh", 0.0)) for r in hourly), 3)
     target_day = _parse_target_date(target_date).strftime("%Y%m%d")
     return {

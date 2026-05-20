@@ -378,14 +378,64 @@ def _service_solar_forecast_for_horizon(
     return rows
 
 
+def _apply_solar_calibration_from_data(
+    data: dict[str, Any],
+    env_weights: dict[str, Any],
+    rows: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    """일별 실측·NWP 쌍으로 1차 보정(scale / residual_mean / scale_and_residual)."""
+    if not env_weights.get("use_dummy_solar_calibration"):
+        return rows, None
+    try:
+        from backend.services.solar_calibration import (
+            apply_solar_calibration,
+            calibration_daily_rows_from_data,
+            parse_calibration_mode,
+        )
+    except ImportError:
+        try:
+            from services.solar_calibration import (
+                apply_solar_calibration,
+                calibration_daily_rows_from_data,
+                parse_calibration_mode,
+            )
+        except ImportError:
+            return rows, None
+
+    actual, nwp = calibration_daily_rows_from_data(data, env_weights)
+    if not actual or not nwp or not rows:
+        return rows, None
+    try:
+        window = int(env_weights.get("solar_calibration_window_days", 30))
+    except (TypeError, ValueError):
+        window = 30
+    dist = str(env_weights.get("solar_calibration_residual_distribution", "proportional"))
+    if dist not in ("proportional", "uniform"):
+        dist = "proportional"
+    mode = parse_calibration_mode(env_weights)
+    rows_out, meta = apply_solar_calibration(
+        rows,
+        actual,
+        nwp,
+        mode=mode,
+        window_days=window,
+        residual_distribution=dist,  # type: ignore[arg-type]
+    )
+    if not meta.get("applied"):
+        return rows, None
+    return rows_out, meta
+
+
 def _resolve_solar_forecast(
     data: dict[str, Any],
     now: datetime,
     deadline: datetime | None,
     env_weights: dict[str, Any],
-) -> tuple[list[dict[str, Any]], str]:
+) -> tuple[list[dict[str, Any]], str, dict[str, Any] | None]:
     """태양광 예측 입력을 서비스 우선으로 구성하고 실패 시 더미로 폴백한다."""
     use_service_solar = bool(env_weights.get("use_service_solar", True))
+    rows: list[dict[str, Any]]
+    src: str
     if use_service_solar:
         service_rows = _service_solar_forecast_for_horizon(
             now=now,
@@ -393,8 +443,15 @@ def _resolve_solar_forecast(
             env_weights=env_weights,
         )
         if service_rows:
-            return service_rows, "SERVICE"
-    return _solar_forecast_for_horizon(data, now, deadline), "DUMMY"
+            rows, src = service_rows, "SERVICE"
+        else:
+            rows = _solar_forecast_for_horizon(data, now, deadline)
+            src = "DUMMY"
+    else:
+        rows = _solar_forecast_for_horizon(data, now, deadline)
+        src = "DUMMY"
+    rows, cal_meta = _apply_solar_calibration_from_data(data, env_weights, rows)
+    return rows, src, cal_meta
 
 
 def _outdoor_temp_forecast_for_horizon(
@@ -680,7 +737,7 @@ def run_job_a_optimization(
     tou_price, tou_price_source = get_tou_price_with_source(resolved_now, pricing_tou)
     deadline = _parse_iso(active_job.get("deadline_at"))
     env_weights = data.get("environment_weights", {})
-    solar_forecast, solar_forecast_source = _resolve_solar_forecast(
+    solar_forecast, solar_forecast_source, solar_calibration_meta = _resolve_solar_forecast(
         data=data,
         now=resolved_now,
         deadline=deadline,
@@ -764,6 +821,22 @@ def run_job_a_optimization(
         "tou_price_krw_per_kwh": tou_price,
         "tou_price_source": tou_price_source,
         "solar_forecast_source": solar_forecast_source,
+        "solar_calibration_alpha": (
+            float(solar_calibration_meta["alpha"])
+            if solar_calibration_meta and solar_calibration_meta.get("alpha") is not None
+            else None
+        ),
+        "solar_calibration_mode": (
+            solar_calibration_meta.get("mode") if solar_calibration_meta else None
+        ),
+        "solar_mean_residual_kwh": (
+            solar_calibration_meta.get("mean_residual_kwh")
+            if solar_calibration_meta
+            else None
+        ),
+        "solar_calibration_applied": (
+            bool(solar_calibration_meta.get("applied")) if solar_calibration_meta else False
+        ),
         "outdoor_temp_source": outdoor_temp_source,
         "remaining_units": remaining_units,
         "factory_count": len(factories),
